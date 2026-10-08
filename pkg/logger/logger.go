@@ -48,6 +48,19 @@ func init() {
 	once.Do(func() {
 		zerolog.SetGlobalLevel(zerolog.InfoLevel)
 
+		// Never leak the build host's absolute source paths into log output
+		// (e.g. /Users/.../picoclaw/pkg/mcp/manager.go:196 on Android bot
+		// logs). Trim caller paths to module-relative form regardless of
+		// whether the binary was built with `go build -trimpath`.
+		zerolog.CallerMarshalFunc = func(pc uintptr, file string, line int) string {
+			if i := strings.LastIndex(file, "picoclaw/"); i >= 0 {
+				file = file[i:]
+			} else {
+				file = filepath.Base(filepath.Dir(file)) + "/" + filepath.Base(file)
+			}
+			return file + ":" + strconv.Itoa(line)
+		}
+
 		isTTY := term.IsTerminal(int(os.Stdout.Fd()))
 
 		consoleWriter = zerolog.ConsoleWriter{
