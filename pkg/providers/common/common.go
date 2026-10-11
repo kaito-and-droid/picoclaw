@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -38,25 +39,36 @@ type (
 
 const DefaultRequestTimeout = 120 * time.Second
 
-// NewHTTPClient creates an *http.Client with an optional proxy and the default timeout.
+// connectTimeout bounds TCP connect (including DNS) for provider calls. The Go default is 30s,
+// which with the agent's 2 retries meant ~96s of waiting on an unreachable host before any
+// fallback could start (PM-135). 10s is ample for a healthy mobile network; it does not limit
+// how long a connected request may take to answer. A var so tests can shorten it.
+var connectTimeout = 10 * time.Second
+
+// newTransport clones http.DefaultTransport (TLS, HTTP/2, idle pooling) with a bounded dialer.
+func newTransport() *http.Transport {
+	var tr *http.Transport
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr = base.Clone()
+	} else {
+		tr = &http.Transport{}
+	}
+	dialer := &net.Dialer{Timeout: connectTimeout, KeepAlive: 30 * time.Second}
+	tr.DialContext = dialer.DialContext
+	return tr
+}
+
+// NewHTTPClient creates an *http.Client with an optional proxy, the default request timeout and a
+// bounded connect timeout.
 func NewHTTPClient(proxy string) *http.Client {
 	client := &http.Client{
-		Timeout: DefaultRequestTimeout,
+		Timeout:   DefaultRequestTimeout,
+		Transport: newTransport(),
 	}
 	if proxy != "" {
 		parsed, err := url.Parse(proxy)
 		if err == nil {
-			// Preserve http.DefaultTransport settings (TLS, HTTP/2, timeouts, etc.)
-			if base, ok := http.DefaultTransport.(*http.Transport); ok {
-				tr := base.Clone()
-				tr.Proxy = http.ProxyURL(parsed)
-				client.Transport = tr
-			} else {
-				// Fallback: minimal transport if DefaultTransport is not *http.Transport.
-				client.Transport = &http.Transport{
-					Proxy: http.ProxyURL(parsed),
-				}
-			}
+			client.Transport.(*http.Transport).Proxy = http.ProxyURL(parsed)
 		} else {
 			log.Printf("common: invalid proxy URL %q: %v", proxy, err)
 		}
@@ -81,6 +93,15 @@ type openaiToolCall struct {
 	ID       string              `json:"id"`
 	Type     string              `json:"type,omitempty"`
 	Function *openaiFunctionCall `json:"function,omitempty"`
+	// ExtraContent carries only the Google thought signature. Gemini's OpenAI-compatible API
+	// reads it from extra_content.google.thought_signature (not function.thought_signature) and
+	// rejects tool-call follow-ups without it. Internal fields such as tool_feedback_explanation
+	// are never sent.
+	ExtraContent *openaiExtraContent `json:"extra_content,omitempty"`
+}
+
+type openaiExtraContent struct {
+	Google *GoogleExtra `json:"google,omitempty"`
 }
 
 type openaiFunctionCall struct {
@@ -196,6 +217,12 @@ func serializeToolCalls(toolCalls []ToolCall) []openaiToolCall {
 				Name:             tc.Name,
 				Arguments:        argsJSON,
 				ThoughtSignature: thoughtSignature,
+			}
+		}
+
+		if wireCall.Function != nil && wireCall.Function.ThoughtSignature != "" {
+			wireCall.ExtraContent = &openaiExtraContent{
+				Google: &GoogleExtra{ThoughtSignature: wireCall.Function.ThoughtSignature},
 			}
 		}
 

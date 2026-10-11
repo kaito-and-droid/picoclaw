@@ -2196,3 +2196,34 @@ func TestSerializeMessages_StripsSystemParts(t *testing.T) {
 		t.Fatal("system_parts should not appear in serialized output")
 	}
 }
+
+// PM-130: Gemini streams the thought signature on the tool_call delta.
+func TestParseStreamResponse_KeepsToolCallThoughtSignature(t *testing.T) {
+	sse := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"web_search\",\"arguments\":\"{\\\"q\\\":\"},\"extra_content\":{\"google\":{\"thought_signature\":\"sig-abc\"}}}]}}]}\n\n" +
+		"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"x\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n" +
+		"data: [DONE]\n\n"
+	resp, err := parseStreamResponse(t.Context(), strings.NewReader(sse), nil)
+	if err != nil {
+		t.Fatalf("parseStreamResponse() error = %v", err)
+	}
+	if len(resp.ToolCalls) != 1 {
+		t.Fatalf("tool calls = %d, want 1", len(resp.ToolCalls))
+	}
+	tc := resp.ToolCalls[0]
+	if tc.ThoughtSignature != "sig-abc" {
+		t.Errorf("ThoughtSignature = %q, want sig-abc", tc.ThoughtSignature)
+	}
+	if tc.ExtraContent == nil || tc.ExtraContent.Google == nil || tc.ExtraContent.Google.ThoughtSignature != "sig-abc" {
+		t.Errorf("ExtraContent not preserved: %+v", tc.ExtraContent)
+	}
+	if tc.Arguments["q"] != "x" {
+		t.Errorf("arguments = %v", tc.Arguments)
+	}
+
+	// Function-level signature fallback.
+	sse2 := "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"c\",\"function\":{\"name\":\"t\",\"arguments\":\"{}\",\"thought_signature\":\"fsig\"}}]}}]}\n\ndata: [DONE]\n\n"
+	resp, err = parseStreamResponse(t.Context(), strings.NewReader(sse2), nil)
+	if err != nil || resp.ToolCalls[0].ThoughtSignature != "fsig" {
+		t.Fatalf("function signature not kept: %v %+v", err, resp)
+	}
+}

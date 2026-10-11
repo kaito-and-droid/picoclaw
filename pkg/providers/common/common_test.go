@@ -1,12 +1,15 @@
 package common
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/sipeed/picoclaw/pkg/providers/protocoltypes"
 )
@@ -38,8 +41,45 @@ func TestNewHTTPClient_WithProxy(t *testing.T) {
 
 func TestNewHTTPClient_NoProxy(t *testing.T) {
 	client := NewHTTPClient("")
-	if client.Transport != nil {
-		t.Errorf("expected nil transport without proxy, got %T", client.Transport)
+	transport, ok := client.Transport.(*http.Transport)
+	if !ok || transport == nil {
+		t.Fatalf("expected http.Transport, got %T", client.Transport)
+	}
+	if transport.Proxy != nil && os.Getenv("HTTPS_PROXY") == "" && os.Getenv("HTTP_PROXY") == "" {
+		// Cloned from DefaultTransport (ProxyFromEnvironment); no explicit proxy is configured.
+		t.Log("using environment proxy settings")
+	}
+}
+
+// PM-135: provider calls must bound TCP connect so an unreachable host fails fast.
+func TestNewHTTPClient_BoundedConnectTimeout(t *testing.T) {
+	old := connectTimeout
+	connectTimeout = 300 * time.Millisecond
+	defer func() { connectTimeout = old }()
+
+	client := NewHTTPClient("")
+	transport := client.Transport.(*http.Transport)
+	if transport.DialContext == nil {
+		t.Fatal("expected a custom DialContext with a connect timeout")
+	}
+	// 10.255.255.1 is unroutable: the dial either times out or is refused immediately.
+	start := time.Now()
+	conn, err := transport.DialContext(context.Background(), "tcp", "10.255.255.1:80")
+	if conn != nil {
+		conn.Close()
+		t.Skip("unexpectedly connected to the blackhole address")
+	}
+	if err == nil {
+		t.Fatal("expected an error dialing an unroutable address")
+	}
+	if elapsed := time.Since(start); elapsed > 3*time.Second {
+		t.Fatalf("dial took %v, want it bounded by the connect timeout", elapsed)
+	}
+}
+
+func TestConnectTimeoutDefault(t *testing.T) {
+	if connectTimeout != 10*time.Second {
+		t.Errorf("connectTimeout = %v, want 10s", connectTimeout)
 	}
 }
 
@@ -191,11 +231,11 @@ func TestSerializeMessages_StripsInternalToolCallExtraContent(t *testing.T) {
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
 	payload := string(data)
-	if strings.Contains(payload, "extra_content") {
-		t.Fatalf("serialized payload should not include internal extra_content: %s", payload)
+	if strings.Contains(payload, "tool_feedback_explanation") || strings.Contains(payload, "sig-ignored-here") {
+		t.Fatalf("serialized payload should not include internal extra_content fields: %s", payload)
 	}
-	if !strings.Contains(payload, "thought_signature") {
-		t.Fatalf("serialized payload should preserve function thought_signature: %s", payload)
+	if !strings.Contains(payload, `"extra_content":{"google":{"thought_signature":"sig-1"}}`) {
+		t.Fatalf("serialized payload should carry the function thought_signature for Gemini: %s", payload)
 	}
 }
 
@@ -252,11 +292,8 @@ func TestSerializeMessages_PreservesGoogleExtraThoughtSignature(t *testing.T) {
 		t.Fatalf("json.Marshal() error = %v", err)
 	}
 	payload := string(data)
-	if strings.Contains(payload, "extra_content") {
-		t.Fatalf("serialized payload should not include extra_content: %s", payload)
-	}
-	if !strings.Contains(payload, `"thought_signature":"sig-1"`) {
-		t.Fatalf("serialized payload should preserve google thought signature: %s", payload)
+	if !strings.Contains(payload, `"extra_content":{"google":{"thought_signature":"sig-1"}}`) {
+		t.Fatalf("serialized payload should send the google thought signature as extra_content: %s", payload)
 	}
 }
 
@@ -798,5 +835,30 @@ func TestParseResponse_WithFunctionThoughtSignature(t *testing.T) {
 			out.ToolCalls[0].ExtraContent.Google.ThoughtSignature,
 			"sig456",
 		)
+	}
+}
+
+func TestSerializeMessages_NoExtraContentWithoutThoughtSignature(t *testing.T) {
+	messages := []Message{
+		{
+			Role: "assistant",
+			ToolCalls: []ToolCall{{
+				ID:   "call_1",
+				Type: "function",
+				Function: &FunctionCall{
+					Name:      "read_file",
+					Arguments: `{"path":"README.md"}`,
+				},
+				ExtraContent: &ExtraContent{ToolFeedbackExplanation: "internal"},
+			}},
+		},
+	}
+
+	data, err := json.Marshal(SerializeMessages(messages))
+	if err != nil {
+		t.Fatalf("json.Marshal() error = %v", err)
+	}
+	if strings.Contains(string(data), "extra_content") {
+		t.Fatalf("non-Gemini tool calls must not carry extra_content: %s", data)
 	}
 }
